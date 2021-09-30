@@ -9,11 +9,16 @@ import random
 import requests
 import functools
 from pathlib import Path
+from typing import Iterable, Tuple, List
 
+import numpy as np
 import pandas as pd
 from lxml import etree
 from loguru import logger
 from yahooquery import Ticker
+from tqdm import tqdm
+from functools import partial
+from concurrent.futures import ProcessPoolExecutor
 
 HS_SYMBOLS_URL = "http://app.finance.ifeng.com/hq/list.php?type=stock_a&class={s_type}"
 
@@ -27,6 +32,7 @@ CALENDAR_BENCH_URL_MAP = {
     "ALL": CALENDAR_URL_BASE.format(market=1, bench_code="000905"),
     # NOTE: Use the time series of ^GSPC(SP500) as the sequence of all stocks
     "US_ALL": "^GSPC",
+    "IN_ALL": "^NSEI",
 }
 
 
@@ -34,13 +40,15 @@ _BENCH_CALENDAR_LIST = None
 _ALL_CALENDAR_LIST = None
 _HS_SYMBOLS = None
 _US_SYMBOLS = None
+_IN_SYMBOLS = None
+_EN_FUND_SYMBOLS = None
 _CALENDAR_MAP = {}
 
 # NOTE: Until 2020-10-20 20:00:00
 MINIMUM_SYMBOLS_NUM = 3900
 
 
-def get_calendar_list(bench_code="CSI300") -> list:
+def get_calendar_list(bench_code="CSI300") -> List[pd.Timestamp]:
     """get SH/SZ history calendar list
 
     Parameters
@@ -61,7 +69,7 @@ def get_calendar_list(bench_code="CSI300") -> list:
 
     calendar = _CALENDAR_MAP.get(bench_code, None)
     if calendar is None:
-        if bench_code.startswith("US_"):
+        if bench_code.startswith("US_") or bench_code.startswith("IN_"):
             df = Ticker(CALENDAR_BENCH_URL_MAP[bench_code]).history(interval="1d", period="max")
             calendar = df.index.get_level_values(level="date").map(pd.Timestamp).unique().tolist()
         else:
@@ -90,6 +98,78 @@ def get_calendar_list(bench_code="CSI300") -> list:
                 calendar = _get_calendar(CALENDAR_BENCH_URL_MAP[bench_code])
         _CALENDAR_MAP[bench_code] = calendar
     logger.info(f"end of get calendar list: {bench_code}.")
+    return calendar
+
+
+def return_date_list(date_field_name: str, file_path: Path):
+    date_list = pd.read_csv(file_path, sep=",", index_col=0)[date_field_name].to_list()
+    return sorted(map(lambda x: pd.Timestamp(x), date_list))
+
+
+def get_calendar_list_by_ratio(
+    source_dir: [str, Path],
+    date_field_name: str = "date",
+    threshold: float = 0.5,
+    minimum_count: int = 10,
+    max_workers: int = 16,
+) -> list:
+    """get calendar list by selecting the date when few funds trade in this day
+
+    Parameters
+    ----------
+    source_dir: str or Path
+        The directory where the raw data collected from the Internet is saved
+    date_field_name: str
+            date field name, default is date
+    threshold: float
+        threshold to exclude some days when few funds trade in this day, default 0.5
+    minimum_count: int
+        minimum count of funds should trade in one day
+    max_workers: int
+        Concurrent number, default is 16
+
+    Returns
+    -------
+        history calendar list
+    """
+    logger.info(f"get calendar list from {source_dir} by threshold = {threshold}......")
+
+    source_dir = Path(source_dir).expanduser()
+    file_list = list(source_dir.glob("*.csv"))
+
+    _number_all_funds = len(file_list)
+
+    logger.info(f"count how many funds trade in this day......")
+    _dict_count_trade = dict()  # dict{date:count}
+    _fun = partial(return_date_list, date_field_name)
+    all_oldest_list = []
+    with tqdm(total=_number_all_funds) as p_bar:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            for date_list in executor.map(_fun, file_list):
+                if date_list:
+                    all_oldest_list.append(date_list[0])
+                for date in date_list:
+                    if date not in _dict_count_trade.keys():
+                        _dict_count_trade[date] = 0
+
+                    _dict_count_trade[date] += 1
+
+                p_bar.update()
+
+    logger.info(f"count how many funds have founded in this day......")
+    _dict_count_founding = {date: _number_all_funds for date in _dict_count_trade.keys()}  # dict{date:count}
+    with tqdm(total=_number_all_funds) as p_bar:
+        for oldest_date in all_oldest_list:
+            for date in _dict_count_founding.keys():
+                if date < oldest_date:
+                    _dict_count_founding[date] -= 1
+
+    calendar = [
+        date
+        for date in _dict_count_trade
+        if _dict_count_trade[date] >= max(int(_dict_count_founding[date] * threshold), minimum_count)
+    ]
+
     return calendar
 
 
@@ -220,6 +300,83 @@ def get_us_stock_symbols(qlib_data_path: [str, Path] = None) -> list:
     return _US_SYMBOLS
 
 
+def get_in_stock_symbols(qlib_data_path: [str, Path] = None) -> list:
+    """get IN stock symbols
+
+    Returns
+    -------
+        stock symbols
+    """
+    global _IN_SYMBOLS
+
+    @deco_retry
+    def _get_nifty():
+        url = f"https://www1.nseindia.com/content/equities/EQUITY_L.csv"
+        df = pd.read_csv(url)
+        df = df.rename(columns={"SYMBOL": "Symbol"})
+        df["Symbol"] = df["Symbol"] + ".NS"
+        _symbols = df["Symbol"].dropna()
+        _symbols = _symbols.unique().tolist()
+        return _symbols
+
+    if _IN_SYMBOLS is None:
+        _all_symbols = _get_nifty()
+        if qlib_data_path is not None:
+            for _index in ["nifty"]:
+                ins_df = pd.read_csv(
+                    Path(qlib_data_path).joinpath(f"instruments/{_index}.txt"),
+                    sep="\t",
+                    names=["symbol", "start_date", "end_date"],
+                )
+                _all_symbols += ins_df["symbol"].unique().tolist()
+
+        def _format(s_):
+            s_ = s_.replace(".", "-")
+            s_ = s_.strip("$")
+            s_ = s_.strip("*")
+            return s_
+
+        _IN_SYMBOLS = sorted(set(_all_symbols))
+
+    return _IN_SYMBOLS
+
+
+def get_en_fund_symbols(qlib_data_path: [str, Path] = None) -> list:
+    """get en fund symbols
+
+    Returns
+    -------
+        fund symbols in China
+    """
+    global _EN_FUND_SYMBOLS
+
+    @deco_retry
+    def _get_eastmoney():
+        url = "http://fund.eastmoney.com/js/fundcode_search.js"
+        resp = requests.get(url)
+        if resp.status_code != 200:
+            raise ValueError("request error")
+        try:
+            _symbols = []
+            for sub_data in re.findall(r"[\[](.*?)[\]]", resp.content.decode().split("= [")[-1].replace("];", "")):
+                data = sub_data.replace('"', "").replace("'", "")
+                # TODO: do we need other informations, like fund_name from ['000001', 'HXCZHH', '华夏成长混合', '混合型', 'HUAXIACHENGZHANGHUNHE']
+                _symbols.append(data.split(",")[0])
+        except Exception as e:
+            logger.warning(f"request error: {e}")
+            raise
+        if len(_symbols) < 8000:
+            raise ValueError("request error")
+        return _symbols
+
+    if _EN_FUND_SYMBOLS is None:
+        _all_symbols = _get_eastmoney()
+
+        _EN_FUND_SYMBOLS = sorted(set(_all_symbols))
+
+    return _EN_FUND_SYMBOLS
+
+
 def symbol_suffix_to_prefix(symbol: str, capital: bool = True) -> str:
     """symbol suffix to prefix
 
@@ -303,6 +460,41 @@ def get_trading_date_by_shift(trading_list: list, trading_date: pd.Timestamp, sh
     except IndexError:
         res = trading_date
     return res
+
+
+def generate_minutes_calendar_from_daily(
+    calendars: Iterable,
+    freq: str = "1min",
+    am_range: Tuple[str, str] = ("09:30:00", "11:29:00"),
+    pm_range: Tuple[str, str] = ("13:00:00", "14:59:00"),
+) -> pd.Index:
+    """generate minutes calendar
+
+    Parameters
+    ----------
+    calendars: Iterable
+        daily calendar
+    freq: str
+        by default 1min
+    am_range: Tuple[str, str]
+        AM Time Range, by default China-Stock: ("09:30:00", "11:29:00")
+    pm_range: Tuple[str, str]
+        PM Time Range, by default China-Stock: ("13:00:00", "14:59:00")
+
+    """
+    daily_format: str = "%Y-%m-%d"
+    res = []
+    for _day in calendars:
+        for _range in [am_range, pm_range]:
+            res.append(
+                pd.date_range(
+                    f"{pd.Timestamp(_day).strftime(daily_format)} {_range[0]}",
+                    f"{pd.Timestamp(_day).strftime(daily_format)} {_range[1]}",
+                    freq=freq,
+                )
+            )
+
+    return pd.Index(sorted(set(np.hstack(res))))
 
 
 if __name__ == "__main__":

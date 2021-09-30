@@ -120,7 +120,7 @@ class DumpDataBase:
         else:
             df = file_or_df
         if df.empty or self.date_field_name not in df.columns.tolist():
-            _calendars = pd.Series()
+            _calendars = pd.Series(dtype=np.float32)
         else:
             _calendars = df[self.date_field_name]
 
@@ -219,7 +219,7 @@ class DumpDataBase:
         # used when creating a bin file
         date_index = self.get_datetime_index(_df, calendar_list)
         for field in self.get_dump_fields(_df.columns):
-            bin_path = features_dir.joinpath(f"{field}.{self.freq}{self.DUMP_FILE_SUFFIX}")
+            bin_path = features_dir.joinpath(f"{field.lower()}.{self.freq}{self.DUMP_FILE_SUFFIX}")
             if field not in _df.columns:
                 continue
             if bin_path.exists() and self._mode == self.UPDATE_MODE:
@@ -234,7 +234,7 @@ class DumpDataBase:
         if isinstance(file_or_data, pd.DataFrame):
             if file_or_data.empty:
                 return
-            code = fname_to_code(file_or_data.iloc[0][self.symbol_field_name].lower())
+            code = fname_to_code(str(file_or_data.iloc[0][self.symbol_field_name]).lower())
             df = file_or_data
         elif isinstance(file_or_data, Path):
             code = self.get_symbol_from_file(file_or_data)
@@ -244,6 +244,10 @@ class DumpDataBase:
         if df is None or df.empty:
             logger.warning(f"{code} data is None or empty")
             return
+
+        # try to remove dup rows or it will cause exception when reindex.
+        df = df.drop_duplicates(self.date_field_name)
+
         # features save dir
         features_dir = self._features_dir.joinpath(code_to_fname(code).lower())
         features_dir.mkdir(parents=True, exist_ok=True)
@@ -401,6 +405,8 @@ class DumpDataUpdate(DumpDataBase):
         )
         self._mode = self.UPDATE_MODE
         self._old_calendar_list = self._read_calendars(self._calendars_dir.joinpath(f"{self.freq}.txt"))
+        # NOTE: all.txt only exists once for each stock
+        # NOTE: if a stock corresponds to multiple different time ranges, user need to modify self._update_instruments
         self._update_instruments = (
             self._read_instruments(self._instruments_dir.joinpath(self.INSTRUMENTS_FILE_NAME))
             .set_index([self.symbol_field_name])
@@ -409,10 +415,9 @@ class DumpDataUpdate(DumpDataBase):
 
         # load all csv files
         self._all_data = self._load_all_source_data()  # type: pd.DataFrame
-        self._update_calendars = sorted(
+        self._new_calendar_list = self._old_calendar_list + sorted(
             filter(lambda x: x > self._old_calendar_list[-1], self._all_data[self.date_field_name].unique())
         )
-        self._new_calendar_list = self._old_calendar_list + self._update_calendars
 
     def _load_all_source_data(self):
         # NOTE: Need more memory
@@ -452,8 +457,16 @@ class DumpDataUpdate(DumpDataBase):
                 if not (isinstance(_start, pd.Timestamp) and isinstance(_end, pd.Timestamp)):
                     continue
                 if _code in self._update_instruments:
+                    # exists stock, will append data
+                    _update_calendars = (
+                        _df[_df[self.date_field_name] > self._update_instruments[_code][self.INSTRUMENTS_START_FIELD]][
+                            self.date_field_name
+                        ]
+                        .sort_values()
+                        .to_list()
+                    )
                     self._update_instruments[_code][self.INSTRUMENTS_END_FIELD] = self._format_datetime(_end)
-                    futures[executor.submit(self._dump_bin, _df, self._update_calendars)] = _code
+                    futures[executor.submit(self._dump_bin, _df, _update_calendars)] = _code
                 else:
                     # new stock
                     _dt_range = self._update_instruments.setdefault(_code, dict())

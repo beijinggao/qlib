@@ -9,21 +9,15 @@ import os
 import numpy as np
 import pandas as pd
 import copy
-from sklearn.metrics import roc_auc_score, mean_squared_error
-import logging
-from ...utils import (
-    unpack_archive_with_buffer,
-    save_multiple_parts_file,
-    create_save_path,
-    drop_nan_by_y_index,
-)
-from ...log import get_module_logger, TimeInspector
+from ...utils import get_or_create_path
+from ...log import get_module_logger
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.data import Sampler
 
+from .pytorch_utils import count_parameters
 from ...model.base import Model
 from ...data.dataset import DatasetH
 from ...data.dataset.handler import DataHandlerLP
@@ -33,10 +27,9 @@ from ...contrib.model.pytorch_gru import GRUModel
 
 class DailyBatchSampler(Sampler):
     def __init__(self, data_source):
-
         self.data_source = data_source
-        self.data = self.data_source.data.loc[self.data_source.get_index()]
-        self.daily_count = self.data.groupby(level=0).size().values  # calculate number of samples in each batch
+        # calculate number of samples in each batch
+        self.daily_count = pd.Series(index=self.data_source.get_index()).groupby("datetime").size().values
         self.daily_index = np.roll(np.cumsum(self.daily_count), 1)  # calculate begin index of each batch
         self.daily_index[0] = 0
 
@@ -62,8 +55,8 @@ class GATs(Model):
         the evaluate metric used in early stop
     optimizer : str
         optimizer name
-    GPU : str
-        the GPU ID(s) used for training
+    GPU : int
+        the GPU ID used for training
     """
 
     def __init__(
@@ -78,7 +71,6 @@ class GATs(Model):
         early_stop=20,
         loss="mse",
         base_model="GRU",
-        with_pretrain=True,
         model_path=None,
         optimizer="adam",
         GPU="0",
@@ -102,11 +94,9 @@ class GATs(Model):
         self.optimizer = optimizer.lower()
         self.loss = loss
         self.base_model = base_model
-        self.with_pretrain = with_pretrain
         self.model_path = model_path
-        self.device = torch.device("cuda:%d" % (GPU) if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda:%d" % (GPU) if torch.cuda.is_available() and GPU >= 0 else "cpu")
         self.n_jobs = n_jobs
-        self.use_gpu = torch.cuda.is_available()
         self.seed = seed
 
         self.logger.info(
@@ -122,7 +112,6 @@ class GATs(Model):
             "\noptimizer : {}"
             "\nloss_type : {}"
             "\nbase_model : {}"
-            "\nwith_pretrain : {}"
             "\nmodel_path : {}"
             "\nvisible_GPU : {}"
             "\nuse_GPU : {}"
@@ -138,7 +127,6 @@ class GATs(Model):
                 optimizer.lower(),
                 loss,
                 base_model,
-                with_pretrain,
                 model_path,
                 GPU,
                 self.use_gpu,
@@ -157,6 +145,9 @@ class GATs(Model):
             dropout=self.dropout,
             base_model=self.base_model,
         )
+        self.logger.info("model:\n{:}".format(self.GAT_model))
+        self.logger.info("model size: {:.4f} MB".format(count_parameters(self.GAT_model)))
+
         if optimizer.lower() == "adam":
             self.train_optimizer = optim.Adam(self.GAT_model.parameters(), lr=self.lr)
         elif optimizer.lower() == "gd":
@@ -166,6 +157,10 @@ class GATs(Model):
 
         self.fitted = False
         self.GAT_model.to(self.device)
+
+    @property
+    def use_gpu(self):
+        return self.device != torch.device("cpu")
 
     def mse(self, pred, label):
         loss = (pred - label) ** 2
@@ -245,7 +240,6 @@ class GATs(Model):
         self,
         dataset,
         evals_result=dict(),
-        verbose=True,
         save_path=None,
     ):
 
@@ -258,11 +252,10 @@ class GATs(Model):
         sampler_train = DailyBatchSampler(dl_train)
         sampler_valid = DailyBatchSampler(dl_valid)
 
-        train_loader = DataLoader(dl_train, sampler=sampler_train, num_workers=self.n_jobs)
-        valid_loader = DataLoader(dl_valid, sampler=sampler_valid, num_workers=self.n_jobs)
+        train_loader = DataLoader(dl_train, sampler=sampler_train, num_workers=self.n_jobs, drop_last=True)
+        valid_loader = DataLoader(dl_valid, sampler=sampler_valid, num_workers=self.n_jobs, drop_last=True)
 
-        if save_path == None:
-            save_path = create_save_path(save_path)
+        save_path = get_or_create_path(save_path)
 
         stop_steps = 0
         train_loss = 0
@@ -272,28 +265,22 @@ class GATs(Model):
         evals_result["valid"] = []
 
         # load pretrained base_model
-        if self.with_pretrain:
-            if self.model_path == None:
-                raise ValueError("the path of the pretrained model should be given first!")
-            self.logger.info("Loading pretrained model...")
-            if self.base_model == "LSTM":
-                pretrained_model = LSTMModel(
-                    d_feat=self.d_feat, hidden_size=self.hidden_size, num_layers=self.num_layers
-                )
-                pretrained_model.load_state_dict(torch.load(self.model_path))
-            elif self.base_model == "GRU":
-                pretrained_model = GRUModel(
-                    d_feat=self.d_feat, hidden_size=self.hidden_size, num_layers=self.num_layers
-                )
-                pretrained_model.load_state_dict(torch.load(self.model_path))
-            else:
-                raise ValueError("unknown base model name `%s`" % self.base_model)
+        if self.base_model == "LSTM":
+            pretrained_model = LSTMModel(d_feat=self.d_feat, hidden_size=self.hidden_size, num_layers=self.num_layers)
+        elif self.base_model == "GRU":
+            pretrained_model = GRUModel(d_feat=self.d_feat, hidden_size=self.hidden_size, num_layers=self.num_layers)
+        else:
+            raise ValueError("unknown base model name `%s`" % self.base_model)
 
-            model_dict = self.GAT_model.state_dict()
-            pretrained_dict = {k: v for k, v in pretrained_model.state_dict().items() if k in model_dict}
-            model_dict.update(pretrained_dict)
-            self.GAT_model.load_state_dict(model_dict)
-            self.logger.info("Loading pretrained model Done...")
+        if self.model_path is not None:
+            self.logger.info("Loading pretrained model...")
+            pretrained_model.load_state_dict(torch.load(self.model_path))
+
+        model_dict = self.GAT_model.state_dict()
+        pretrained_dict = {k: v for k, v in pretrained_model.state_dict().items() if k in model_dict}
+        model_dict.update(pretrained_dict)
+        self.GAT_model.load_state_dict(model_dict)
+        self.logger.info("Loading pretrained model Done...")
 
         # train
         self.logger.info("training...")
@@ -345,10 +332,7 @@ class GATs(Model):
             feature = data[:, :, 0:-1].to(self.device)
 
             with torch.no_grad():
-                if self.use_gpu:
-                    pred = self.GAT_model(feature.float()).detach().cpu().numpy()
-                else:
-                    pred = self.GAT_model(feature.float()).detach().numpy()
+                pred = self.GAT_model(feature.float()).detach().cpu().numpy()
 
             preds.append(pred)
 

@@ -5,33 +5,76 @@
 from __future__ import division
 from __future__ import print_function
 
-import os
+import re
 import abc
-import time
+import copy
 import queue
 import bisect
-import logging
-import importlib
-import traceback
 import numpy as np
 import pandas as pd
 from multiprocessing import Pool
+from typing import Iterable, Union
 
 from .cache import H
 from ..config import C
-from .ops import Operators
-from ..log import get_module_logger
-from ..utils import parse_field, read_bin, hash_args, normalize_cache_fields, code_to_fname
 from .base import Feature
+from .ops import Operators
+from .inst_processor import InstProcessor
+
+from ..log import get_module_logger
 from .cache import DiskDatasetCache, DiskExpressionCache
-from ..utils import Wrapper, init_instance_by_config, register_wrapper, get_module_by_module_path
+from ..utils import (
+    Wrapper,
+    init_instance_by_config,
+    register_wrapper,
+    get_module_by_module_path,
+    parse_field,
+    hash_args,
+    normalize_cache_fields,
+    code_to_fname,
+)
 
 
-class CalendarProvider(abc.ABC):
+class ProviderBackendMixin:
+    def get_default_backend(self):
+        backend = {}
+        provider_name: str = re.findall("[A-Z][^A-Z]*", self.__class__.__name__)[-2]
+        # set default storage class
+        backend.setdefault("class", f"File{provider_name}Storage")
+        # set default storage module
+        backend.setdefault("module_path", "qlib.data.storage.file_storage")
+        return backend
+
+    def backend_obj(self, **kwargs):
+        backend = self.backend if self.backend else self.get_default_backend()
+        backend = copy.deepcopy(backend)
+
+        # set default storage kwargs
+        backend_kwargs = backend.setdefault("kwargs", {})
+        # default provider_uri map
+        if "provider_uri" not in backend_kwargs:
+            # if the user has no uri configured, use: uri = uri_map[freq]
+            # NOTE: provider_uri priority：
+            #   1. backend_config: backend_obj["kwargs"]["provider_uri"]
+            #   2. backend_config: backend_obj["kwargs"]["provider_uri_map"]
+            #   3. qlib.init: provider_uri
+            provider_uri_map = backend_kwargs.setdefault("provider_uri_map", {})
+            freq = kwargs.get("freq", "day")
+            if freq not in provider_uri_map:
+                provider_uri_map[freq] = C.dpm.get_data_path(freq)
+            backend_kwargs["provider_uri"] = provider_uri_map[freq]
+        backend.setdefault("kwargs", {}).update(**kwargs)
+        return init_instance_by_config(backend)
+
+
+class CalendarProvider(abc.ABC, ProviderBackendMixin):
     """Calendar provider base class
 
     Provide calendar data.
     """
+
+    def __init__(self, *args, **kwargs):
+        self.backend = kwargs.get("backend", {})
 
     @abc.abstractmethod
     def calendar(self, start_time=None, end_time=None, freq="day", future=False):
@@ -127,11 +170,14 @@ class CalendarProvider(abc.ABC):
         return hash_args(start_time, end_time, freq, future)
 
 
-class InstrumentProvider(abc.ABC):
+class InstrumentProvider(abc.ABC, ProviderBackendMixin):
     """Instrument provider base class
 
     Provide instrument data.
     """
+
+    def __init__(self, *args, **kwargs):
+        self.backend = kwargs.get("backend", {})
 
     @staticmethod
     def instruments(market="all", filter_pipe=None):
@@ -165,13 +211,23 @@ class InstrumentProvider(abc.ABC):
                 'filter_start_time': None,
                 'filter_end_time': None}]}
         """
+        from .filter import SeriesDFilter
+
         if filter_pipe is None:
             filter_pipe = []
         config = {"market": market, "filter_pipe": []}
         # the order of the filters will affect the result, so we need to keep
         # the order
         for filter_t in filter_pipe:
-            config["filter_pipe"].append(filter_t.to_config())
+            if isinstance(filter_t, dict):
+                _config = filter_t
+            elif isinstance(filter_t, SeriesDFilter):
+                _config = filter_t.to_config()
+            else:
+                raise TypeError(
+                    f"Unsupported filter types: {type(filter_t)}! Filter only supports dict or isinstance(filter, SeriesDFilter)"
+                )
+            config["filter_pipe"].append(_config)
         return config
 
     @abc.abstractmethod
@@ -215,11 +271,14 @@ class InstrumentProvider(abc.ABC):
         raise ValueError(f"Unknown instrument type {inst}")
 
 
-class FeatureProvider(abc.ABC):
+class FeatureProvider(abc.ABC, ProviderBackendMixin):
     """Feature provider class
 
     Provide feature data.
     """
+
+    def __init__(self, *args, **kwargs):
+        self.backend = kwargs.get("backend", {})
 
     @abc.abstractmethod
     def feature(self, instrument, field, start_time, end_time, freq):
@@ -304,7 +363,7 @@ class DatasetProvider(abc.ABC):
     """
 
     @abc.abstractmethod
-    def dataset(self, instruments, fields, start_time=None, end_time=None, freq="day"):
+    def dataset(self, instruments, fields, start_time=None, end_time=None, freq="day", inst_processors=[]):
         """Get dataset data.
 
         Parameters
@@ -319,6 +378,8 @@ class DatasetProvider(abc.ABC):
             end of the time range.
         freq : str
             time frequency.
+        inst_processors:  Iterable[Union[dict, InstProcessor]]
+            the operations performed on each instrument
 
         Returns
         ----------
@@ -335,6 +396,7 @@ class DatasetProvider(abc.ABC):
         end_time=None,
         freq="day",
         disk_cache=1,
+        inst_processors=[],
         **kwargs,
     ):
         """Get task uri, used when generating rabbitmq task in qlib_server
@@ -355,7 +417,8 @@ class DatasetProvider(abc.ABC):
             whether to skip(0)/use(1)/replace(2) disk_cache.
 
         """
-        return DiskDatasetCache._uri(instruments, fields, start_time, end_time, freq, disk_cache)
+        # TODO: qlib-server support inst_processors
+        return DiskDatasetCache._uri(instruments, fields, start_time, end_time, freq, disk_cache, inst_processors)
 
     @staticmethod
     def get_instruments_d(instruments, freq):
@@ -396,7 +459,7 @@ class DatasetProvider(abc.ABC):
         return [ExpressionD.get_expression_instance(f) for f in fields]
 
     @staticmethod
-    def dataset_processor(instruments_d, column_names, start_time, end_time, freq):
+    def dataset_processor(instruments_d, column_names, start_time, end_time, freq, inst_processors=[]):
         """
         Load and process the data, return the data set.
         - default using multi-kernel method.
@@ -422,6 +485,7 @@ class DatasetProvider(abc.ABC):
                         normalize_column_names,
                         spans,
                         C,
+                        inst_processors,
                     ),
                 )
         else:
@@ -436,6 +500,7 @@ class DatasetProvider(abc.ABC):
                         normalize_column_names,
                         None,
                         C,
+                        inst_processors,
                     ),
                 )
 
@@ -457,7 +522,9 @@ class DatasetProvider(abc.ABC):
         return data
 
     @staticmethod
-    def expression_calculator(inst, start_time, end_time, freq, column_names, spans=None, g_config=None):
+    def expression_calculator(
+        inst, start_time, end_time, freq, column_names, spans=None, g_config=None, inst_processors=[]
+    ):
         """
         Calculate the expressions for one instrument, return a df result.
         If the expression has been calculated before, load from cache.
@@ -481,13 +548,17 @@ class DatasetProvider(abc.ABC):
         data.index = _calendar[data.index.values.astype(int)]
         data.index.names = ["datetime"]
 
-        if spans is None:
-            return data
-        else:
+        if spans is not None:
             mask = np.zeros(len(data), dtype=bool)
             for begin, end in spans:
                 mask |= (data.index >= begin) & (data.index <= end)
-            return data[mask]
+            data = data[mask]
+
+        for _processor in inst_processors:
+            if _processor:
+                _processor_obj = init_instance_by_config(_processor, accept_types=InstProcessor)
+                data = _processor_obj(data)
+        return data
 
 
 class LocalCalendarProvider(CalendarProvider):
@@ -497,12 +568,8 @@ class LocalCalendarProvider(CalendarProvider):
     """
 
     def __init__(self, **kwargs):
+        super(LocalCalendarProvider, self).__init__(**kwargs)
         self.remote = kwargs.get("remote", False)
-
-    @property
-    def _uri_cal(self):
-        """Calendar file uri."""
-        return os.path.join(C.get_data_path(), "calendars", "{}.txt")
 
     def load_calendar(self, freq, future):
         """Load original calendar timestamp from file.
@@ -517,18 +584,22 @@ class LocalCalendarProvider(CalendarProvider):
         list
             list of timestamps
         """
-        if future:
-            fname = self._uri_cal.format(freq + "_future")
-            # if future calendar not exists, return current calendar
-            if not os.path.exists(fname):
-                get_module_logger("data").warning(f"{freq}_future.txt not exists, return current calendar!")
-                fname = self._uri_cal.format(freq)
-        else:
-            fname = self._uri_cal.format(freq)
-        if not os.path.exists(fname):
-            raise ValueError("calendar not exists for freq " + freq)
-        with open(fname) as f:
-            return [pd.Timestamp(x.strip()) for x in f]
+
+        try:
+            backend_obj = self.backend_obj(freq=freq, future=future).data
+        except ValueError:
+            if future:
+                get_module_logger("data").warning(
+                    f"load calendar error: freq={freq}, future={future}; return current calendar!"
+                )
+                get_module_logger("data").warning(
+                    "You can get future calendar by referring to the following document: https://github.com/microsoft/qlib/blob/main/scripts/data_collector/contrib/README.md"
+                )
+                backend_obj = self.backend_obj(freq=freq, future=False).data
+            else:
+                raise
+
+        return [pd.Timestamp(x) for x in backend_obj]
 
     def calendar(self, start_time=None, end_time=None, freq="day", future=False):
         _calendar, _calendar_index = self._get_calendar(freq, future)
@@ -559,38 +630,15 @@ class LocalInstrumentProvider(InstrumentProvider):
     Provide instrument data from local data source.
     """
 
-    def __init__(self):
-        pass
-
-    @property
-    def _uri_inst(self):
-        """Instrument file uri."""
-        return os.path.join(C.get_data_path(), "instruments", "{}.txt")
-
-    def _load_instruments(self, market):
-        fname = self._uri_inst.format(market)
-        if not os.path.exists(fname):
-            raise ValueError("instruments not exists for market " + market)
-
-        _instruments = dict()
-        df = pd.read_csv(
-            fname,
-            sep="\t",
-            usecols=[0, 1, 2],
-            names=["inst", "start_datetime", "end_datetime"],
-            dtype={"inst": str},
-            parse_dates=["start_datetime", "end_datetime"],
-        )
-        for row in df.itertuples(index=False):
-            _instruments.setdefault(row[0], []).append((row[1], row[2]))
-        return _instruments
+    def _load_instruments(self, market, freq):
+        return self.backend_obj(market=market, freq=freq).data
 
     def list_instruments(self, instruments, start_time=None, end_time=None, freq="day", as_list=False):
         market = instruments["market"]
         if market in H["i"]:
             _instruments = H["i"][market]
         else:
-            _instruments = self._load_instruments(market)
+            _instruments = self._load_instruments(market, freq=freq)
             H["i"][market] = _instruments
         # strip
         # use calendar boundary
@@ -601,7 +649,7 @@ class LocalInstrumentProvider(InstrumentProvider):
             inst: list(
                 filter(
                     lambda x: x[0] <= x[1],
-                    [(max(start_time, x[0]), min(end_time, x[1])) for x in spans],
+                    [(max(start_time, pd.Timestamp(x[0])), min(end_time, pd.Timestamp(x[1]))) for x in spans],
                 )
             )
             for inst, spans in _instruments.items()
@@ -627,25 +675,14 @@ class LocalFeatureProvider(FeatureProvider):
     """
 
     def __init__(self, **kwargs):
+        super(LocalFeatureProvider, self).__init__(**kwargs)
         self.remote = kwargs.get("remote", False)
-
-    @property
-    def _uri_data(self):
-        """Static feature file uri."""
-        return os.path.join(C.get_data_path(), "features", "{}", "{}.{}.bin")
 
     def feature(self, instrument, field, start_index, end_index, freq):
         # validate
-        field = str(field).lower()[1:]
+        field = str(field)[1:]
         instrument = code_to_fname(instrument)
-        uri_data = self._uri_data.format(instrument.lower(), field, freq)
-        if not os.path.exists(uri_data):
-            get_module_logger("data").warning("WARN: data not found for %s.%s" % (instrument, field))
-            return pd.Series(dtype=np.float32)
-            # raise ValueError('uri_data not found: ' + uri_data)
-        # load
-        series = read_bin(uri_data, start_index, end_index)
-        return series
+        return self.backend_obj(instrument=instrument, field=field, freq=freq)[start_index : end_index + 1]
 
 
 class LocalExpressionProvider(ExpressionProvider):
@@ -653,9 +690,6 @@ class LocalExpressionProvider(ExpressionProvider):
 
     Provide expression data from local data source.
     """
-
-    def __init__(self):
-        super().__init__()
 
     def expression(self, instrument, field, start_time=None, end_time=None, freq="day"):
         expression = self.get_expression_instance(field)
@@ -688,7 +722,15 @@ class LocalDatasetProvider(DatasetProvider):
     def __init__(self):
         pass
 
-    def dataset(self, instruments, fields, start_time=None, end_time=None, freq="day"):
+    def dataset(
+        self,
+        instruments,
+        fields,
+        start_time=None,
+        end_time=None,
+        freq="day",
+        inst_processors=[],
+    ):
         instruments_d = self.get_instruments_d(instruments, freq)
         column_names = self.get_column_names(fields)
         cal = Cal.calendar(start_time, end_time, freq)
@@ -697,7 +739,9 @@ class LocalDatasetProvider(DatasetProvider):
         start_time = cal[0]
         end_time = cal[-1]
 
-        data = self.dataset_processor(instruments_d, column_names, start_time, end_time, freq)
+        data = self.dataset_processor(
+            instruments_d, column_names, start_time, end_time, freq, inst_processors=inst_processors
+        )
 
         return data
 
@@ -840,6 +884,7 @@ class ClientDatasetProvider(DatasetProvider):
         freq="day",
         disk_cache=0,
         return_uri=False,
+        inst_processors=[],
     ):
         if Inst.get_inst_type(instruments) == Inst.DICT:
             get_module_logger("data").warning(
@@ -879,7 +924,7 @@ class ClientDatasetProvider(DatasetProvider):
                 start_time = cal[0]
                 end_time = cal[-1]
 
-                data = self.dataset_processor(instruments_d, column_names, start_time, end_time, freq)
+                data = self.dataset_processor(instruments_d, column_names, start_time, end_time, freq, inst_processors)
                 if return_uri:
                     return data, feature_uri
                 else:
@@ -892,6 +937,13 @@ class ClientDatasetProvider(DatasetProvider):
             - using single-process implementation.
 
             """
+            # TODO: support inst_processors, need to change the code of qlib-server at the same time
+            # FIXME: The cache after resample, when read again and intercepted with end_time, results in incomplete data date
+            if inst_processors:
+                raise ValueError(
+                    f"{self.__class__.__name__} does not support inst_processor. "
+                    f"Please use `D.features(disk_cache=0)` or `qlib.init(dataset_cache=None)`"
+                )
             self.conn.send_request(
                 request_type="feature",
                 request_content={
@@ -911,7 +963,7 @@ class ClientDatasetProvider(DatasetProvider):
             get_module_logger("data").debug("get result")
             try:
                 # pre-mound nfs, used for demo
-                mnt_feature_uri = os.path.join(C.get_data_path(), C.dataset_cache_dir_name, feature_uri)
+                mnt_feature_uri = C.dpm.get_data_path(freq).joinpath(C.dataset_cache_dir_name, feature_uri)
                 df = DiskDatasetCache.read_data_from_cache(mnt_feature_uri, start_time, end_time, fields)
                 get_module_logger("data").debug("finish slicing data")
                 if return_uri:
@@ -949,6 +1001,7 @@ class BaseProvider:
         end_time=None,
         freq="day",
         disk_cache=None,
+        inst_processors=[],
     ):
         """
         Parameters:
@@ -963,9 +1016,11 @@ class BaseProvider:
         disk_cache = C.default_disk_cache if disk_cache is None else disk_cache
         fields = list(fields)  # In case of tuple.
         try:
-            return DatasetD.dataset(instruments, fields, start_time, end_time, freq, disk_cache)
+            return DatasetD.dataset(
+                instruments, fields, start_time, end_time, freq, disk_cache, inst_processors=inst_processors
+            )
         except TypeError:
-            return DatasetD.dataset(instruments, fields, start_time, end_time, freq)
+            return DatasetD.dataset(instruments, fields, start_time, end_time, freq, inst_processors=inst_processors)
 
 
 class LocalProvider(BaseProvider):
@@ -1013,13 +1068,22 @@ class ClientProvider(BaseProvider):
     """
 
     def __init__(self):
+        def is_instance_of_provider(instance: object, cls: type):
+            if isinstance(instance, Wrapper):
+                p = getattr(instance, "_provider", None)
+
+                return False if p is None else isinstance(p, cls)
+
+            return isinstance(instance, cls)
+
         from .client import Client
 
         self.client = Client(C.flask_server, C.flask_port)
         self.logger = get_module_logger(self.__class__.__name__)
-        if isinstance(Cal, ClientCalendarProvider):
+        if is_instance_of_provider(Cal, ClientCalendarProvider):
             Cal.set_conn(self.client)
-        Inst.set_conn(self.client)
+        if is_instance_of_provider(Inst, ClientInstrumentProvider):
+            Inst.set_conn(self.client)
         if hasattr(DatasetD, "provider"):
             DatasetD.provider.set_conn(self.client)
         else:
@@ -1064,7 +1128,8 @@ def register_all_wrappers(C):
     register_wrapper(Cal, _calendar_provider, "qlib.data")
     logger.debug(f"registering Cal {C.calendar_provider}-{C.calendar_cache}")
 
-    register_wrapper(Inst, C.instrument_provider, "qlib.data")
+    _instrument_provider = init_instance_by_config(C.instrument_provider, module)
+    register_wrapper(Inst, _instrument_provider, "qlib.data")
     logger.debug(f"registering Inst {C.instrument_provider}")
 
     if getattr(C, "feature_provider", None) is not None:
